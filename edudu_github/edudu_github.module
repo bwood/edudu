@@ -1,0 +1,618 @@
+<?php
+/**
+ * Implements hook_menu().
+ */
+require_once drupal_get_path('module', 'edudu') . '/edudu.common.inc';
+
+function edudu_github_menu() {
+  $items = array();
+
+  $items['admin/edudu/projects_github'] = array(
+    'title' => 'EduDU GitHub Projects',
+    'description' => 'Load GitHub projects into edudu_github_project content type',
+    'page callback' => 'edudu_github_load',
+    'access arguments' => array('access administration pages'),
+    //'page arguments' => array()
+    'weight' => 2,
+  );
+
+  $items['admin/edudu/members_github'] = array(
+    'title' => 'EduDU GitHub Members',
+    'description' => 'Add edudu github org members',
+    'page callback' => 'edudu_github_members',
+    'access arguments' => array('access administration pages'),
+    //'page arguments' => array()
+    'weight' => 2,
+  );
+
+  return $items;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function edudu_github_form_alter(&$form, &$form_state, $form_id) {
+  $x = 1;
+  switch ($form_id) {
+    case "github_resource_node_form":
+      //TODO: this should be the first
+      $form['actions']['submit']['#validate'][] = 'edudu_github_resource_node_form_validate';
+      $form['actions']['submit']['#submit'][] = 'edudu_github_resource_node_form_submit';
+      break;
+  }
+}
+
+/**
+ * Implementation of hook_node_validate
+ *
+ * @param $node
+ * @param $form
+ * @param $form_state
+ */
+function edudu_github_resource_node_form_validate($form, &$form_state) {
+  $name = $form_state['values']['field_edudu_github_user_or_org'][$form_state['node']->language][0]['value'];
+  /*
+    //do we already have this user/org
+    if (is_object(edudu_entity_exists($name, 'github_resource', 'field_edudu_github_user_or_org'))) {
+      form_set_error('field_edudu_github_user_or_org', t("Thanks, but someone has already added the Github user/org: %name", array('%name' => $name)));
+    }
+  */
+  //Did we get a github user or a github org?
+  $data = edudu_github_user_org($name);
+  $form_state['edudu_github']['data'] = $data;
+  if (array_key_exists('user', $data)) {
+    $form_state['edudu_github']['user_or_org'] = 'user';
+  }
+  elseif (array_key_exists('organization', $data)) {
+    $form_state['edudu_github']['user_or_org'] = 'organization';
+  }
+  else {
+    form_set_error('field_edudu_github_username', t("Neither a user nor an organization called %name was found on Github.", array('%name' => $name)));
+    // if ((array_key_exists('errors', $data)) && (is_array($data['errors']))) watchdog...
+  }
+}
+
+function edudu_github_resource_node_form_submit($form, &$form_state) {
+  if (!is_array($form_state['edudu_github'])) {
+    drupal_set_message("No data returned from Github.", "error");
+    watchdog("No data returned from Github.", "error");
+    return;
+  }
+  if (array_key_exists('user_or_org', $form_state['edudu_github'])) {
+    $user_or_org = $form_state['edudu_github']['user_or_org'];
+    //both the name of a user and the name of an org are found under the 'login'
+    //key
+    $name = $form_state['edudu_github']['data'][$user_or_org]['login'];
+  }
+
+  $repos = edudu_github_get_repos($name, $user_or_org);
+
+  edudu_github_load_github_metadata($repos, $name);
+
+}
+
+/**
+ * Return array similar to $form_state['values'] representing the edudu_project
+ * entity.
+ *
+ * todo
+ * ['triggering_element']['#parents'][0] = "submit"
+ */
+function edudu_github_project_form_values() {
+  //FIXME: don't hardcode language
+  $language = LANGUAGE_NONE;
+  $project = array(
+    'language' => $language, //leave this. I assumed it should be here.
+    'values' => array(
+      'language' => $language,
+      //leave this.  edudu_project assumes it should be here
+      'title' => '',
+      'field_edudu_project_download_url' => array($language => array(array('value' => NULL))),
+      'field_edudu_version_control_url' => array($language => array(array('value' => NULL))),
+      'field_edudu_project_html_url' => array($language => array(array('value' => NULL))),
+      //term reference auto-complete
+      'field_edudu_code_type' => array($language => NULL),
+      //Fake a file submission. Un-requiring this field is a bit hard
+      //FIXME: need a better default fid
+      'field_edudu_info_file' => array(
+        $language => array(
+          array(
+            'fid' => 54,
+            'display' => 1,
+            'description' => NULL,
+            'upload' => NULL,
+          )
+        )
+      ),
+    ),
+    'triggering_element' => array('#parents' => array("submit")),
+    //If you don't provide a submit_handler, drupal_submit_form will do nothing.
+    'submit_handlers' => array(
+      'edudu_project_node_form_custom_submit',
+      'node_form_submit',
+    ),
+  );
+
+  return $project;
+}
+
+function edudu_github_load_github_metadata($repos, $name) {
+
+  foreach ($repos as $r) {
+
+    $branches = edudu_github_analyze_repo($name, $r);
+
+    while (list($branch_name, $branch) = each($branches)) { //branches as k,v k=branchname
+      //add some additional info from analysis to $r
+      $r['code_type'] = $branch['code_type'];
+      while (list($file_name, $content) = each($branch['info_files'])) {
+        $project = edudu_github_project_form_values();
+        //if we don't get some trees recursively, we won't always have an info file
+        //$file_name=none if we didn't get one
+        if ($file_name != "none") {
+          $project['edudu_project_info_file'] = drupal_parse_info_format($content);
+          $project['values']['title'] = $file_name . "-" . $project['edudu_project_info_file']['core'];
+        }
+        else {
+          $project['edudu_project_info_file'] = array();
+          //FIXME: Since no info file, we're using title values that deviate
+          $project['values']['title'] = $r['name'] . " (" . $branch_name . ")";//from what we'd see if there were an info file.
+
+        }
+        while (list($k, $v) = each($project['values'])) {
+          $r_key = edudu_github_map_project_github($k);
+          if ((!array_key_exists($r_key, $r)) || (strpos($k, 'field_edudu') === FALSE) || ($k == 'field_edudu_info_file')) {
+            continue;
+          }
+          switch ($k) {
+            case "field_edudu_code_type":
+              //term reference handling
+              $project['values'][$k][$project['language']] = $r[$r_key];
+              break;
+            default:
+              $project['values'][$k][$project['language']][0]['value'] = $r[$r_key];
+              break;
+          }
+        }
+        edudu_github_submit_project_form($project);
+        reset($project['values']);
+      }
+    }
+
+
+  }
+
+}
+
+function edudu_github_analyze_repo($name, $r) {
+  global $conf;
+  $autoload = libraries_get_path('composer') . '/autoload.php';
+  require_once $autoload;
+
+  //$client = new Github\Client();
+  $github_api_cache = variable_get('file_temporary_path', file_directory_temp()) . '/github-api-cache';
+  $client = new Github\Client(
+    new Github\HttpClient\CachedHttpClient(array('cache_dir' => $github_api_cache))
+  );
+
+  $client->authenticate($conf['edudu_ghu'], $conf['edudu_ghp'], Github\Client::AUTH_HTTP_PASSWORD);
+
+  $errors = array();
+  $branches = array();
+
+  //don't get tree recursively if repo size exceeds max
+  $max = 600;
+  $recursive = TRUE;
+  if ($r['size'] > 600) {
+    $recursive = FALSE;
+    drupal_set_message(t("The repository %name is fairly large. We are just taking a cursory look at it.", array('%name' => $r['name'])), 'warning');
+  }
+
+  try {
+    //get branches for repo
+    $branches = $client->api('repo')->branches($name, $r['name']);
+  }
+  catch (Github\Exception\RuntimeException $re) {
+    $errors['branches'] = $re->getMessage();
+  }
+
+  $drupal_branches = array('9.x', '8.x', '7.x', '6.x', '5.x');
+  $branches_try = array();
+  foreach ($branches as $b) {
+    foreach ($drupal_branches as $db) {
+      if (strpos($b['name'], $db) !== FALSE) {
+        //TODO: get latest commit?
+        $branches_try[] = array(
+          'name' => $b['name'],
+          'sha' => $b['commit']['sha']
+        );
+      }
+    }
+  }
+
+  //If no drupal branches were found, look for files in the master branch
+  if (count($branches_try) == 0) {
+    reset($branches);
+    foreach ($branches as $b) {
+      if ($b['name'] == "master") {
+        $branches_try = array(
+          array(
+            'name' => $b['name'],
+            'sha' => $b['commit']['sha']
+          )
+        );
+      }
+    }
+  }
+
+  if (count($branches_try) == 0) {
+    drupal_set_message(t("Repository %repo: Didn't find known branches: master, %drupal_branches", array(
+      '%repo' => $r['name'],
+      '%drupal_branches' => implode(', ', $drupal_branches)
+    )), 'warning');
+    return;
+  }
+
+  $files = array();
+  foreach ($branches_try as $bt) {
+    try {
+      //get trees of branches
+      $files[$bt['name']] = $client->api('git_data')->trees()
+        ->show($name, $r['name'], $bt['sha'], $recursive);
+      //Need the branch's sha
+      $files[$bt['name']]['sha'] = $bt['sha'];
+    }
+    catch (Github\Exception\RuntimeException $re) {
+      $errors['trees'][] = $re->getMessage();
+    }
+  }
+
+  if (count($files) === 0) {
+    drupal_set_message(t("Repository %repo: Didn't find files in known branches: master, %drupal_branches", array(
+      '%repo' => $r['name'],
+      '%drupal_branches' => implode(', ', $drupal_branches)
+    )), 'warning');
+    //TODO: could have had an emtpy 7.x branch and the code is really in master
+    return;
+  }
+
+  $types = array();
+  $analysis = array();
+  while (list($branch_name, $v) = each($files)) {
+    foreach ($v['tree'] as $file) {
+      if ($file['type'] == 'tree') {
+        $tree = array();
+        $tree['path'] = $file['path'];
+        $tree['url'] = $file['url'];
+        $tree['sha'] = $file['sha'];
+        $types['tree'][] = $tree;
+      }
+      if ($file['type'] == 'blob') {
+        $blob = array();
+        $blob['path'] = $file['path'];
+        $blob['url'] = $file['url'];
+        $blob['sha'] = $file['sha'];
+        $types['blob'][] = $blob;
+      }
+      if (substr($file['path'], -5) == '.info') {
+        $info = array();
+        $info['path'] = $file['path'];
+        $info['url'] = $file['url'];
+        $info['sha'] = $file['sha'];
+        $types['info'][] = $info;
+      }
+      if (substr($file['path'], -13) == 'CHANGELOG.txt') {
+        $changelog = array();
+        $changelog['path'] = $file['path'];
+        $changelog['url'] = $file['url'];
+        $changelog['sha'] = $file['sha'];
+        $types['changelog'][] = $changelog;
+      }
+      if (substr($file['path'], -11) == 'UPGRADE.txt') {
+        $upgrade = array();
+        $upgrade['path'] = $file['path'];
+        $upgrade['url'] = $file['url'];
+        $upgrade['sha'] = $file['sha'];
+        $types['upgrade'][] = $upgrade;
+      }
+      if (substr($file['path'], -10) == 'update.php') {
+        $update = array();
+        $update['path'] = $file['path'];
+        $update['url'] = $file['url'];
+        $update['sha'] = $file['sha'];
+        $types['update'][] = $update;
+      }
+      if (substr($file['path'], -8) == 'cron.php') {
+        $cron = array();
+        $cron['path'] = $file['path'];
+        $cron['url'] = $file['url'];
+        $cron['sha'] = $file['sha'];
+        $types['cron'][] = $cron;
+      }
+      if (substr($file['path'], -13) == '.features.inc') {
+        $feature = array();
+        $feature['path'] = $file['path'];
+        $feature['url'] = $file['url'];
+        $feature['sha'] = $file['sha'];
+        $types['feature'][] = $feature;
+      }
+      if (substr($file['path'], -14) == '.strongarm.inc') {
+        $strongarm = array();
+        $strongarm['path'] = $file['path'];
+        $strongarm['url'] = $file['url'];
+        $strongarm['sha'] = $file['sha'];
+        $types['strongarm'][] = $strongarm;
+      }
+      if (substr($file['path'], -7) == '.module') {
+        $module = array();
+        $module['path'] = $file['path'];
+        $module['url'] = $file['url'];
+        $module['sha'] = $file['sha'];
+        $types['module'][] = $module;
+      }
+      if (substr($file['path'], -5) == '.make') {
+        $make = array();
+        $make['path'] = $file['path'];
+        $make['url'] = $file['url'];
+        $make['sha'] = $file['sha'];
+        $types['make'][] = $make;
+      }
+      if (substr($file['path'], -8) == '.profile') {
+        $profile = array();
+        $profile['path'] = $file['path'];
+        $profile['url'] = $file['url'];
+        $profile['sha'] = $file['sha'];
+        $types['profile'][] = $profile;
+      }
+      if (substr($file['path'], -12) == 'template.php') {
+        $template_php = array();
+        $template_php['path'] = $file['path'];
+        $template_php['url'] = $file['url'];
+        $template_php['sha'] = $file['sha'];
+        $types['template_php'][] = $template_php;
+      }
+
+
+    }
+
+    $x = 1;
+    //edudu_github_get_info_files($name, $r['name'], $types);
+    $analysis[$branch_name] = array(
+          'types' => $types,
+          'code_type' => edudu_github_guess_code($types),
+          'info_files' => edudu_github_get_info_files($name, $r['name'], $v['sha'], $types),
+    );
+  }
+  return $analysis;
+}
+
+function edudu_github_guess_code($types) {
+
+  if ((array_key_exists('changelog', $types)) &&
+    (array_key_exists('upgrade', $types)) &&
+    (array_key_exists('update', $types)) &&
+    (array_key_exists('cron', $types)) &&
+    (count($types['changelog']) > 0) &&
+    (count($types['upgrade']) > 0) &&
+    (count($types['update']) > 0) &&
+    (count($types['cron']) > 0) //&&
+  ) {
+    $guess = "Core";
+  }
+  elseif ((array_key_exists('tree', $types)) &&
+    (array_key_exists('blob', $types)) &&
+    (count($types['tree']) > 0) &&
+    (count($types['blob']) == 0)
+    //TODO: filter out .gitignore and other ignoreables
+  ) {
+    $guess = "Subdirectory";
+  }
+  elseif ((array_key_exists('feature', $types)) &&
+    (count($types['feature']) > 0)
+  ) {
+    $guess = "Feature(s)";
+  }
+  elseif ((array_key_exists('info', $types)) &&
+    (array_key_exists('module', $types)) &&
+    (!array_key_exists('feature', $types)) &&
+    (count($types['info']) > 0) &&
+    (count($types['module']) > 0)
+  ) {
+    $guess = "Module(s)";
+  }
+  elseif ((array_key_exists('info', $types)) &&
+    (!array_key_exists('module', $types)) &&
+    (array_key_exists('template_php', $types)) &&
+    (count($types['info']) > 0) &&
+    (count($types['template_php']) > 0)
+  ) {
+    $guess = "Theme(s)";
+  }
+  //TODO: Theme, Drush make, install profile
+  else {
+    $guess = "Unknown";
+  }
+
+  //Append possibilities:
+  if ((array_key_exists('make', $types)) &&
+    (count($types['make']) > 0)
+  ) {
+      $guess .= " with Drush Makefile(s)";
+  }
+  if ((array_key_exists('profile', $types)) &&
+    (count($types['make']) > 0)
+  ) {
+    $guess .= " with Install Profile(s)";
+  }
+  if ((array_key_exists('strongarm', $types)) &&
+    (count($types['strongarm']) > 0)
+  ) {
+    $guess .= " with Strongarmed Variables";
+  }
+    return $guess;
+}
+
+function edudu_github_map_project_github($field) {
+  $map = array(
+    //edudu_project field --> github data
+    'field_edudu_project_download_url' => 'downloads_url',
+    'field_edudu_version_control_url' => 'clone_url',
+    'field_edudu_project_html_url' => 'html_url',
+    'field_edudu_code_type' => 'code_type',
+    //'' => '',
+  );
+  if (array_key_exists($field, $map)) {
+    $field = $map[$field];
+  }
+  return $field;
+}
+
+function edudu_github_submit_project_form($project) {
+  $node_type = array('type' => "edudu_project");
+  drupal_form_submit('edudu_project_node_form', $project, (object) $node_type);
+  $errors = form_get_errors();
+}
+
+function edudu_github_get_repos($name, $user_or_org) {
+  global $conf;
+  $autoload = libraries_get_path('composer') . '/autoload.php';
+  require_once $autoload;
+
+  //$client = new Github\Client();
+  $github_api_cache = variable_get('file_temporary_path', file_directory_temp()) . '/github-api-cache';
+  $client = new Github\Client(
+    new Github\HttpClient\CachedHttpClient(array('cache_dir' => $github_api_cache))
+  );
+
+  $client->authenticate($conf['edudu_ghu'], $conf['edudu_ghp'], Github\Client::AUTH_HTTP_PASSWORD);
+
+  $repositories = $client->api($user_or_org)->repositories($name);
+
+  return $repositories;
+}
+
+function edudu_github_get_info_files($user, $repo, $branch_sha, $types) {
+  if (!array_key_exists('info', $types)) {
+    return array('none' => 'none');
+  }
+
+  global $conf;
+  $autoload = libraries_get_path('composer') . '/autoload.php';
+  require_once $autoload;
+
+  //$client = new Github\Client();
+  $github_api_cache = variable_get('file_temporary_path', file_directory_temp()) . '/github-api-cache';
+  $client = new Github\Client(
+    new Github\HttpClient\CachedHttpClient(array('cache_dir' => $github_api_cache))
+  );
+
+  $client->authenticate($conf['edudu_ghu'], $conf['edudu_ghp'], Github\Client::AUTH_HTTP_PASSWORD);
+
+  $info_files = array();
+  foreach ($types['info'] as $info) {
+    //get the filename
+    $parts = explode('/', $info['path']);
+    $file_name = str_replace('.info', '', array_pop($parts));
+    try {
+      $info_files[$file_name] = $client->api('repo')->contents()
+        ->download($user, $repo, $info['path'], $branch_sha); //FIXME: is this sha the correct one to give?
+    }
+    catch (Github\Exception\RuntimeException $re) {
+      $errors['info_download'][] = $re->getMessage();
+    }
+
+  }
+  return $info_files;
+}
+
+
+/**
+ * DEPRECATED
+ *
+ * Load data retrieved from the GitHub api into edudu_github_project
+ */
+function edudu_github_load($name, $user_or_org) {
+  global $conf;
+  $autoload = libraries_get_path('composer') . '/autoload.php';
+  require_once $autoload;
+
+  //$client = new Github\Client();
+  $github_api_cache = variable_get('file_temporary_path', file_directory_temp()) . '/github-api-cache';
+  $client = new Github\Client(
+    new Github\HttpClient\CachedHttpClient(array('cache_dir' => $github_api_cache))
+  );
+
+  $client->authenticate($conf['edudu_ghu'], $conf['edudu_ghp'], Github\Client::AUTH_HTTP_PASSWORD);
+
+  $repositories = $client->api($user_or_org)->repositories($name);
+
+  foreach ($repositories as $repo) {
+    edudu_entity_load('edudu_project', $repo, 'field_edudu_github_id');
+  }
+}
+
+function edudu_github_user_org($user_or_org) {
+  global $conf;
+
+  //FIXME: ?
+  $autoload = libraries_get_path('composer') . '/autoload.php';
+  require_once $autoload;
+  $github_api_cache = variable_get('file_temporary_path', file_directory_temp()) . '/github-api-cache';
+  $client = new Github\Client(
+    new Github\HttpClient\CachedHttpClient(array('cache_dir' => $github_api_cache))
+  );
+  //TODO: deal with credentials
+  $client->authenticate($conf['edudu_ghu'], $conf['edudu_ghp'], Github\Client::AUTH_HTTP_PASSWORD);
+
+  $data = array();
+
+  // On github orgs are users, but users aren't orgs, so search for org first.
+  try {
+    $org = $client->api('organization')->show($user_or_org);
+  }
+  catch (Github\Exception\RuntimeException $re) {
+    $data['errors']['organization'] = $re->getMessage();
+  }
+  if (!isset($org)) {
+    try {
+      $user = $client->api('user')->show($user_or_org);
+    }
+    catch (Github\Exception\RuntimeException $re) {
+      $data['errors']['user'] = $re->getMessage();
+    }
+  }
+  if (isset($user)) {
+    $data['user'] = $user;
+  }
+  if (isset($org)) {
+    $data['organization'] = $org;
+  }
+
+  return $data;
+}
+
+/**
+ * Testing...
+ */
+function edudu_github_members() {
+
+  //Fixme: do this just once, not in every function that needs it.
+  $autoload = libraries_get_path('composer') . '/autoload.php';
+  require_once $autoload;
+
+  $github_api_cache = variable_get('file_temporary_path', file_directory_temp()) . '/github-api-cache';
+  $client = new Github\Client(
+    new Github\HttpClient\CachedHttpClient(array('cache_dir' => $github_api_cache))
+  );
+  //$client->authenticate('', '', Github\Client::AUTH_HTTP_PASSWORD); //works
+  $client->authenticate('', '', Github\Client::AUTH_HTTP_PASSWORD);
+
+  $teams = $client->api('organization')->teams()->all('eduduorg');
+
+  $result = $client->api('organization')->teams()
+    ->addMember(401591, 'ucbdrupal');
+  //$members = $client->api('organization')->teams()->members('Members');//fail
+  $x = 1;
+}
+
+

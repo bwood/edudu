@@ -1,0 +1,475 @@
+<?php
+require_once drupal_get_path('module', 'edudu') . '/edudu.common.inc';
+
+
+/**
+ * Implements hook_menu().
+ */
+function edudu_projects_menu() {
+  $items = array();
+
+  $items['admin/edudu'] = array(
+    'title' => 'eduDU',
+    'description' => '',
+    'page callback' => 'edudu_projects_main',
+    'access arguments' => array('access administration pages'),
+    'weight' => 9,
+    //'file' => 'edudu.admin.inc',
+  );
+  $items['admin/edudu/projects'] = array(
+    'title' => 'EduDU Load Projects',
+    'description' => 'Load .info files found under files/edudu_projects into edudu_project content type',
+    'page callback' => 'edudu_projects_load',
+    'access arguments' => array('access administration pages'),
+    'weight' => 1,
+    //'page arguments' => array()
+  );
+
+  return $items;
+}
+
+
+/**
+ * Menu callback; prints a page listing a glossary of Drupal terminology.
+ */
+function edudu_projects_main() {
+  // Add CSS
+  //drupal_add_css(drupal_get_path('module', 'edudu') . '/edudu.css');
+  $output = '<h2>' . t('eduDU topics') . '</h2>';
+  return $output;
+}
+
+/**
+ * Implements hook_form_alter().
+ */
+function edudu_projects_form_alter(&$form, &$form_state, $form_id) {
+  $x = 1;
+  switch ($form_id) {
+    case "edudu_project_node_form":
+
+      //auto_nodetitle not quite right here.
+      $form['title']['#access'] = FALSE;
+      // when submitted interactively hide the fields who's values are derived from the .info file
+      $form['field_edudu_core']['#access'] = FALSE;
+      $form['field_edudu_php_version']['#access'] = FALSE;
+      $form['field_edudu_project_machine_nam']['#access'] = FALSE;
+      $form['field_edudu_project_dependencies']['#access'] = FALSE;
+      $form['field_edudu_project_datestamp']['#access'] = FALSE;
+      $form['field_edudu_project_version']['#access'] = FALSE;
+      $form['field_edudu_project_description']['#access'] = FALSE;
+      $form['field_edudu_drupal_project_name']['#access'] = FALSE;
+
+      //$form['#after_build'][] = 'edudu_project_form_after_build';
+      //required if submitted interactively
+
+
+      //Custom submit
+      //$form['actions']['submit']['#validate'][] = 'edudu_project_node_form_validate';
+      $form['actions']['submit']['#validate'][] = 'edudu_project_node_form_validate';
+      array_unshift($form['actions']['submit']['#submit'], 'edudu_project_node_form_custom_submit');
+
+      //$form['actions']['submit']['#submit'][] = 'edudu_project_submit';
+      break;
+  }
+}
+
+/*
+function edudu_project_form_after_build($form, &$form_state) {
+  $form['field_edudu_info_file'][$form['field_edudu_info_file']['#language']][0]['#required'] = FALSE;
+  $form['field_edudu_project_download_url'][$form['field_edudu_project_download_url']['#language']][0]['#required'] = TRUE;
+  return $form;
+}
+*/
+
+function edudu_project_node_form_validate($form, &$form_state) {
+  $fid = $form_state['values']['field_edudu_info_file'][$form_state['node']->language][0]['fid'];
+  $file = file_load($fid);
+  $info = drupal_parse_info_file($file->uri);
+
+  //Is the info file valid
+  if ((!is_array($info)) || (!array_key_exists('name', $info)) || (!array_key_exists('description', $info)) || (!array_key_exists('core', $info))) {
+    form_set_error('field_info_file', t("Info file could not be parsed. It might be missing a required property like 'name,' 'description' or 'core'."));
+  }
+
+  //Append Drupal core info to title
+  $form_state['values']['title'] = str_replace('.info', '', $file->filename) . "-" . $info['core'];
+
+  //Do we already have this .info file?
+  //TODO: if submitting new title can't match. If editing existing, then skip entity_exists
+  //if $form['nid']['#value'] !== NULL, then we are editing the node.
+  if (($form['nid']['#value'] === NULL) && (is_object(edudu_entity_exists($form_state['values']['title'], 'edudu_project', 'title')))) {
+    //todo: provide a link to the existing node
+    form_set_error('field_info_file', t("Thanks, but someone has already added %drupal_name.", array('%drupal_name' => $form_state['values']['title'])));
+  }
+
+  $form_state['edudu_project_info_file'] = $info;
+}
+
+/**
+ * Corresponds to edudu.common.inc: edudu_entity_load
+ *
+ * @param $form
+ * @param $form_state
+ */
+function edudu_project_node_form_custom_submit($form, &$form_state) {
+
+  //TODO: correct way to ignore the submission when you click upload on the file field?
+  if ((isset($form_state['triggering_element']['#value']) && ($form_state['triggering_element']['#value'] == "Upload"))) {
+    return;
+  }
+
+
+  $info = $form_state['edudu_project_info_file'];
+  //TODO: cleanup
+  //$language = $form_state['values']['language']; //where it's found when edudu_project submitted
+  //$language = $form_state['language']; //where it's found when edudu_github_resource submitted
+  $language = LANGUAGE_NONE;
+
+  $form_state['values']['field_edudu_project_machine_nam'][$language][0]['value'] = $form_state['values']['title'];
+
+
+  while (list($k, $v) = each($form_state['values'])) {
+    if (strpos($k, 'field_edudu') === FALSE) {
+      continue;
+    }
+    $info_key = edudu_map_project_info($k);
+    if (!array_key_exists($info_key, $info)) {
+      continue;
+    }
+    //TODO: malicious values in info file?
+    switch ($k) {
+
+      case 'field_edudu_project_dependencies':
+        $i = 0;
+        foreach ($info[$info_key] as $dep) {
+          $form_state['values'][$k][$language][$i]['value'] = $dep;
+          $form_state['values'][$k][$language][$i]['_weight'] = $i;
+          $i++;
+        }
+        break;
+      /*
+        case 'datestamp':
+          $form_state['values'][$k][$language][0]['value'] = $info[$info_key];
+          break;
+      */
+      default:
+        $form_state['values'][$k][$language][0]['value'] = $info[$info_key];
+        break;
+    }
+  }
+}
+
+
+//TODO: refactor this and edudu_entity_update
+/**
+ * Another approach here, would be to update form_state['values'] with the info
+ * file data and then invoke the node submit handler with on the edudu_project
+ * bundle
+ */
+/**
+ * Compare retrieved data to the contents of an existing entity return data
+ * elements that differ from entity elements
+ * @param $data
+ * @param $entity
+ */
+function edudu_project_update($form_state, $entity_wrapper) {
+  $updated = FALSE;
+  //form data
+  $form_values = $form_state['values'];
+  //parsed info file data
+
+  $language = $form_values['language'];
+
+  /*
+   * In general we only want to process fields beginning with
+   * 'field_edudu_github_', but there are a few additional fields to
+   * process in $additional_fields
+   */
+  //$additional_fields = array('body', 'title');
+
+  /*
+   * language also is a key in $form_values and this causes:
+   * EntityMetadataWrapperException: Invalid data value given. Be sure it matches the required data type and format. in EntityMetadataWrapper->set() (line 122 of /Users/bwood/Sites/pantheon/edudu/sites/all/modules/entity/includes/entity.wrapper.inc).
+   */
+  $skip = array('url', 'language', 'nid', 'type', 'comment');
+  foreach ($entity_wrapper as $field => $value) {
+    $form_field = edudu_map_project_info($field);
+    if ((in_array($field, $skip)) || (!isset($form_values[$form_field]))) {
+      continue;
+    }
+
+    $entity_value = $entity_wrapper->$field->value();
+
+    /*
+    //FIXME: better way?
+    if ((is_array($entity_value)) && (array_key_exists('value', $entity_value))) {
+      //will be true for field_type = text_formatted (e.g. body) and others...?
+      $entity_value = $entity_value['value'];
+    }
+    */
+
+    /*
+     * Update the entity_field_value as appropriate for different field types.
+     */
+    //TODO: Could this be improved?
+    $field_type = $entity_wrapper->$field->type();
+    if (!is_array($form_values[$form_field])) {
+      $fval = $form_values[$form_field];
+    }
+    else {
+      switch ($field_type) {
+        case "text_formatted":
+          if ((is_array($entity_value)) && (array_key_exists('value', $entity_value))) {
+            //will be true for field_type = text_formatted (e.g. body) and others...?
+            $entity_value = $entity_value['value'];
+          }
+          break;
+        /*
+        case "taxonomy_term":
+          $fval = $form_values[$form_field][$language][0];
+          break;
+        */
+        /* not needed here
+        case "date":
+          //setting a date http://drupal.org/node/1803286#comment-6850692
+          // do strtotime() on $form_values so that when we compare $form_values[$form_field]
+          // to existing value the comparison is accurate
+          $form_values[$form_field] = strtotime($form_values[$form_field]); //[$language][] needed
+          break;
+        */
+        default:
+          //works for taxonomy_term, text
+          $fval = $form_values[$form_field][$language][0]['value'];
+
+      }
+    }
+    if ($entity_value != $fval) {
+      $updated = TRUE;
+      /*
+       * Update the entity_metadata_wrapper as appropriate for different field
+       * types
+       */
+
+      switch ($field_type) {
+        case "text_formatted":
+          $entity_wrapper->$field->set(array('value' => $fval));
+          break;
+        default:
+          $entity_wrapper->$field->set($fval);
+      }
+
+
+      //get title for set_message
+      if ($form_field == 'title') {
+        $project = $form_values[$form_values_field];
+      }
+    }
+  }
+  //Only update if something's changed
+  if ($updated) {
+    $entity_wrapper->save();
+    if (TRUE) { //verbose argument?
+      drupal_set_message(t("Updated EduDU Project: %project", array('%project' => $project)));
+    }
+  }
+}
+
+function edudu_map_project_info($field) {
+  $map = array(
+    //fixme: consistent fieldnaming would make this unneeded.
+    //edudu_project field --> info file parameter
+    'field_edudu_drupal_project_name' => 'name',
+    //'field_edudu_project_machine_nam' => '', //special handling
+    'field_edudu_core' => 'core',
+    'field_edudu_php_version' => 'php',
+    'field_edudu_project_dependencies' => 'dependencies',
+    'field_edudu_project_datestamp' => 'datestamp',
+    'field_edudu_project_version' => 'version',
+    'field_edudu_project_description' => 'description',
+  );
+  if (array_key_exists($field, $map)) {
+    $field = $map[$field];
+  }
+  return $field;
+}
+
+/**
+ * Update edudu_project with the parsed values of info file
+ *
+ * @param $form_state
+ * @param $entity_wrapper
+ */
+function edudu_project_info_update($form_state, $entity_wrapper) {
+  $updated = FALSE;
+  //form data
+  $form_values = $form_state['values'];
+  //parsed info file data
+  while (list($k, $v) = each($form_state['edudu_project']['info'])) {
+    //prevent conflict
+    if ($k == 'name') {
+      $k = 'info_name';
+    }
+    $form_values[$k] = $v;
+  }
+
+  $language = $form_values['language'];
+
+  /*
+   * In general we only want to process fields beginning with
+   * 'field_edudu_github_', but there are a few additional fields to
+   * process in $additional_fields
+   */
+  //$additional_fields = array('body', 'title');
+
+  /*
+   * language also is a key in $form_values and this causes:
+   * EntityMetadataWrapperException: Invalid data value given. Be sure it matches the required data type and format. in EntityMetadataWrapper->set() (line 122 of /Users/bwood/Sites/pantheon/edudu/sites/all/modules/entity/includes/entity.wrapper.inc).
+   */
+  $skip = array('url', 'language', 'nid');
+  foreach ($entity_wrapper as $field => $value) {
+    if (in_array($field, $skip)) {
+      continue;
+    }
+
+    //$github_field = edudu_map_github($field);// renamed to $form_field
+    $form_field = edudu_map_project($field);
+    $entity_value = $entity_wrapper->$field->value();
+
+    /*
+    //FIXME: better way?
+    if ((is_array($entity_value)) && (array_key_exists('value', $entity_value))) {
+      //will be true for field_type = text_formatted (e.g. body) and others...?
+      $entity_value = $entity_value['value'];
+    }
+    */
+
+    /*
+     * Update the entity_field_value as appropriate for different field types.
+     */
+    //TODO: Could this be improved?
+    $field_type = $entity_wrapper->$field->type();
+    switch ($field_type) {
+      case "text_formatted":
+        if ((is_array($entity_value)) && (array_key_exists('value', $entity_value))) {
+          //will be true for field_type = text_formatted (e.g. body) and others...?
+          $entity_value = $entity_value['value'];
+        }
+        break;
+      case "date":
+        //setting a date http://drupal.org/node/1803286#comment-6850692
+        // do strtotime() on $form_values so that when we compare $form_values[$form_field]
+        // to existing value the comparison is accurate
+        $form_values[$form_field] = strtotime($form_values[$form_field]);
+        break;
+      default:
+        $entity_wrapper->$field->set($form_values[$form_field]);
+    }
+
+    if ((isset($form_values[$form_field])) && ($entity_value != $form_values[$form_field])) {
+      $updated = TRUE;
+      /*
+       * Update the entity_metadata_wrapper as appropriate for different field
+       * types
+       */
+
+      $dval = array();
+      if (is_array($form_values[$form_field])) {
+        //the value is in a form field
+        foreach ($form_values[$form_field][$language] as $v) {
+          $dval[] = $v['value'];
+        }
+      }
+      else {
+        //the value was parsed from the info file
+        $dval[] = $form_values[$form_field];
+      }
+
+      foreach ($dval as $dv) {
+        switch ($field_type) {
+          case "text_formatted":
+            $entity_wrapper->$field->set(array('value' => $form_values[$form_field]));
+            break;
+          default:
+            $entity_wrapper->$field->set($form_values[$form_field]);
+        }
+      }
+
+      //get title for set_message
+      if ($form_field == 'name') {
+        $repo_name = $form_values[$form_field];
+      }
+    }
+  }
+  //Only update if something's changed
+  if ($updated) {
+    $entity_wrapper->save();
+    if (TRUE) { //verbose argument?
+      drupal_set_message(t("Updated info for user/org GitHub repository: %name", array('%name' => $repo_name)));
+    }
+  }
+}
+
+
+function edudu_projects_update_OLD($form_state) {
+
+
+  ///////
+  $node->type = 'edudu_project';
+  //TODO: implement locale
+  $node->language = LANGUAGE_NONE;
+  $node->title = isset($info['name']) ? $info['name'] : $info['project'];
+  $node->body[$node->language][0]['value'] = isset($info['description']) ? $info['description'] : NULL;
+  $node->body[$node->language][0]['format'] = 'plain_text';
+  $node->field_core[$node->language][0]['value'] = isset($info['core']) ? $info['core'] : NULL;
+  $node->field_php_version[$node->language][0]['value'] = isset($info['php']) ? $info['php'] : NULL;
+  $node->field_project_machine_name[$node->language][0]['value'] = $info['project']; //will exist.  checked in load()
+  $node->field_datestamp[$node->language][0]['value'] = isset($info['datestamp']) ? $info['datestamp'] : NULL;
+  $node->field_version[$node->language][0]['value'] = isset($info['version']) ? $info['version'] : NULL;
+
+  if ((array_key_exists('dependencies', $info)) && (is_array($info['dependencies']))) {
+    while (list($k, $v) = each($info['dependencies'])) {
+      $node->field_dependencies[$node->language][$k]['value'] = $v;
+      $node->field_dependencies[$node->language][]['format'] = 'plain_text';
+    }
+  }
+
+  node_object_prepare($node);
+
+//TODO: only create revision when there are changes.
+//LEFT OFF: increement revision not correct?
+  if (isset($result['node'])) {
+    //persist these values from the existing node
+    //$node->created = $created;
+    $node->log = t("imported at %time ", array('%time' => time()));
+    $node->revision += 1;
+  }
+  node_save($node);
+
+}
+
+
+/*
+ * Read dir containing projects and return metadata to be loaded into site
+ */
+function edudu_projects_load_from_filesystem() {
+  $import_uid = 1;
+  $out = NULL;
+  //TODO: create dir in install. use tmp?
+  $dir = drupal_realpath('public://') . '/edudu_projects';
+  //TODO: recurse
+  //$info = drupal_parse_info_file($dir . '/panopoly_core/panopoly_core.info');
+  $info_files = glob($dir . "/*/*/*.info");
+  foreach ($info_files as $if) {
+    $info = drupal_parse_info_file($if);
+
+    //validate info file
+    if (!isset($info['project'])) {
+      $out .= "REJECTED: $if <br />";
+      continue;
+    }
+
+    edudu_projects_update($info);
+    $out .= "Loaded: " . $info['name'] . "<br />";
+  }
+  return $out;
+}

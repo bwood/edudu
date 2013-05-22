@@ -1,0 +1,6 @@
+core = 7.x
+description = "eduDU Misc module"
+name = " EduDU"
+project = edudu
+dependencies[] = entity
+version = 7.x-0.1
