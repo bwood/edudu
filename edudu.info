@@ -3,4 +3,5 @@ description = "eduDU Misc module"
 name = " EduDU"
 project = edudu
 dependencies[] = entity
+dependencies[] = date
 version = 7.x-0.1
