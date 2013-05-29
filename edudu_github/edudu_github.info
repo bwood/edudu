@@ -3,4 +3,5 @@ description = "eduDU GitHub"
 name = " EduDU GitHub Functionality"
 project = edudu
 dependencies[] = edudu_projects
+dependencies[] = libraries
 version = 7.x-0.1
